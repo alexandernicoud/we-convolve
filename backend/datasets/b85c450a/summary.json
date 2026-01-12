@@ -1,0 +1,17 @@
+{
+  "dataset_id": "b85c450a",
+  "extracted_path": "/Users/alexandernicoud/Desktop/convolve-broken frontend/backend/app/../datasets/b85c450a/images",
+  "total_images": 64,
+  "label_distribution": {
+    "1": 32,
+    "0": 32
+  },
+  "example_filenames": [
+    "AAPL_2025-05-18_to_2025-11-18_label1.png",
+    "MSFT_2025-06-21_to_2025-12-19_label0.png",
+    "GOOGL_2025-06-17_to_2025-12-17_label1.png",
+    "MSFT_2025-06-22_to_2025-12-22_label0.png",
+    "AAPL_2025-05-10_to_2025-11-10_label1.png"
+  ],
+  "created_at": 1767108426.010798
+}

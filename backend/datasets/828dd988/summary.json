@@ -1,0 +1,17 @@
+{
+  "dataset_id": "828dd988",
+  "extracted_path": "/Users/alexandernicoud/Desktop/convolve-insights/backend/app/../datasets/828dd988/images",
+  "total_images": 8,
+  "label_distribution": {
+    "0": 4,
+    "1": 4
+  },
+  "example_filenames": [
+    "AMZN_2025-06-23_to_2025-12-23_label0.png",
+    "AAPL_2025-05-30_to_2025-11-28_label1.png",
+    "AAPL_2025-06-23_to_2025-12-23_label0.png",
+    "GOOGL_2025-06-23_to_2025-12-23_label0.png",
+    "AMZN_2025-06-18_to_2025-12-18_label1.png"
+  ],
+  "created_at": 1766772485.499582
+}

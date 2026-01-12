@@ -1,0 +1,17 @@
+{
+  "dataset_id": "00b994e0",
+  "extracted_path": "/Users/alexandernicoud/Desktop/convolve-broken frontend/backend/app/../datasets/00b994e0/images",
+  "total_images": 6000,
+  "label_distribution": {
+    "1": 3000,
+    "0": 3000
+  },
+  "example_filenames": [
+    "AAPL_2010-05-30_to_2010-11-30_label1.png",
+    "AAPL_2011-07-26_to_2012-01-26_label1.png",
+    "AAPL_2017-07-25_to_2018-01-25_label0.png",
+    "AAPL_2019-04-08_to_2019-10-08_label1.png",
+    "AAPL_2015-04-14_to_2015-10-14_label1.png"
+  ],
+  "created_at": 1767792632.999316
+}

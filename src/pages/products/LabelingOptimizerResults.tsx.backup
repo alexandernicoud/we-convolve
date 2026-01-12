@@ -1,0 +1,935 @@
+import { useState, useEffect, useCallback } from "react";
+import { Link, useParams } from "react-router-dom";
+import { ArrowLeft, ChevronLeft, ChevronRight, Server } from "lucide-react";
+import dynamic from "next/dynamic";
+
+// Dynamically import Plotly to avoid SSR issues
+const Plot = dynamic(() => import("react-plotly.js"), { ssr: false });
+
+// Type definitions
+type Section<T> = { status: "ok"; data: T } | { status: "missing" } | { status: "error"; error: string };
+import { labelingOptimizerApi } from "@/lib/api";
+
+// Artifact resolver functions
+function resolveArtifactName(availableArtifacts: string[], preferredNames: string[]): string | null {
+  for (const name of preferredNames) {
+    if (availableArtifacts.includes(name)) {
+      return name;
+    }
+  }
+  return null;
+}
+
+function resolveMetrics(artifacts: string[]): string | null {
+  return resolveArtifactName(artifacts, ['metrics.json', 'metrics']);
+}
+
+function resolveHeatmapsCagr(artifacts: string[]): string | null {
+  return resolveArtifactName(artifacts, [
+    'heatmaps_cagr.json',
+    'heatmaps_cagr',
+    'tp_sl_heatmap_grid_cagr.json',
+    'tp_sl_heatmap_grid_cagr'
+  ]);
+}
+
+function resolveHeatmapsLinear(artifacts: string[]): string | null {
+  return resolveArtifactName(artifacts, [
+    'heatmaps_linear.json',
+    'heatmaps_linear',
+    'tp_sl_heatmap_grid_annual_linear_pl.json',
+    'tp_sl_heatmap_grid_annual_linear_pl'
+  ]);
+}
+
+function resolveVoxelCube(artifacts: string[], symbol?: string): string | null {
+  const preferredNames = [
+    `${symbol}_voxel_cube_cagr.json`,
+    `${symbol}_voxel_cube_cagr`,
+    'voxel_cube_cagr.json',
+    'voxel_cube_cagr',
+    'voxel_points.json',
+    'voxel_points',
+    'voxel_points_top.json',
+    'voxel_points_top'
+  ];
+  return resolveArtifactName(artifacts, preferredNames);
+}
+
+function resolveTimeseries(artifacts: string[], symbol?: string): string | null {
+  const preferredNames = [
+    `${symbol}_best_timeseries.json`,
+    `${symbol}_best_timeseries`,
+    'best_timeseries.json',
+    'best_timeseries',
+    'best_system_timeseries.json',
+    'best_system_timeseries'
+  ];
+  return resolveArtifactName(artifacts, preferredNames);
+}
+
+function resolveYearlyReturns(artifacts: string[], symbol?: string): string | null {
+  const preferredNames = [
+    `${symbol}_yearly_returns.json`,
+    `${symbol}_yearly_returns`,
+    'yearly_returns.json',
+    'yearly_returns',
+    'yearly_compounded.json',
+    'yearly_compounded'
+  ];
+  return resolveArtifactName(artifacts, preferredNames);
+}
+
+// JSON normalizers
+function normalizeHeatmaps(data: any): Section<any> {
+  try {
+    if (!data) return { status: "missing" };
+
+    // Handle different heatmap formats
+    let tp_values = data.tp_values || [];
+    let sl_values = data.sl_values || [];
+    let horizons: Record<string, number[][]> = {};
+
+    if (data.horizons) {
+      // Format: horizons: { "1": matrix, "5": matrix, ... }
+      for (const [horizon, matrix] of Object.entries(data.horizons)) {
+        if (Array.isArray(matrix)) {
+          horizons[horizon] = (matrix as any[][]).map(row =>
+            row.map(val => val === null ? NaN : val)
+          );
+        } else if (matrix && typeof matrix === 'object' && 'z' in matrix) {
+          // Format: horizons: { "1": { "z": matrix }, ... }
+          horizons[horizon] = ((matrix as any).z || []).map((row: any[]) =>
+            row.map(val => val === null ? NaN : val)
+          );
+        }
+      }
+    }
+
+    return {
+      status: "ok",
+      data: {
+        title: data.title || 'Heatmaps',
+        tp_values,
+        sl_values,
+        horizons,
+        vmin: data.vmin,
+        vmax: data.vmax
+      }
+    };
+  } catch (err) {
+    console.error("❌ Heatmap normalization failed:", err);
+    return { status: "error", error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+function normalizeVoxelCube(data: any, symbol?: string): Section<any> {
+  try {
+    if (!data) return { status: "missing" };
+
+  // If it's already in the right format
+  if (Array.isArray(data.tp) && Array.isArray(data.sl) && Array.isArray(data.h)) {
+    return {
+      status: "ok",
+      data: {
+        tp: data.tp,
+        sl: data.sl,
+        h: data.h,
+        metric: data.metric || data.cagr,
+        metric_name: data.metric_name || 'CAGR',
+        colorscale: data.colorscale || 'Viridis'
+      }
+    };
+  }
+
+  // Handle array of objects format
+  if (Array.isArray(data)) {
+    return {
+      status: "ok",
+      data: {
+        tp: data.map(d => d.tp || d.take_profit),
+        sl: data.map(d => d.sl || d.stop_loss),
+        h: data.map(d => d.h || d.horizon),
+        metric: data.map(d => d.metric || d.cagr || 0),
+        metric_name: 'CAGR',
+        colorscale: 'Viridis'
+      }
+    };
+  }
+
+  return { status: "error", error: "Unsupported voxel cube data format" };
+} catch (err) {
+  console.error("❌ Voxel cube normalization failed:", err);
+  return { status: "error", error: err instanceof Error ? err.message : String(err) };
+}
+}
+
+function normalizeTimeseries(data: any): Section<any> {
+  try {
+    if (!data) return { status: "missing" };
+
+  // Handle different timeseries formats
+  const dates = data.dates || data.index || [];
+  let strategy = data.strategy || data.strategy_cum_compounded || data.strategy_compounded_pct || [];
+  let price_dates = data.price_dates || data.dates || data.index || [];
+  let price = data.price || data.price_norm || data.price_normalized_pct || [];
+
+  // Ensure we have arrays
+  if (!Array.isArray(strategy) && data.strategy_cum_compounded) {
+    strategy = data.strategy_cum_compounded;
+  }
+  if (!Array.isArray(price) && data.price_norm) {
+    price = data.price_norm;
+  }
+
+  return {
+    status: "ok",
+    data: {
+      dates: Array.isArray(dates) ? dates : [],
+      strategy: Array.isArray(strategy) ? strategy : [],
+      price_dates: Array.isArray(price_dates) ? price_dates : [],
+      price: Array.isArray(price) ? price : []
+    }
+  };
+} catch (err) {
+  console.error("❌ Timeseries normalization failed:", err);
+  return { status: "error", error: err instanceof Error ? err.message : String(err) };
+}
+
+function normalizeYearlyReturns(data: any): Section<any> {
+  try {
+    if (!data) return { status: "missing" };
+
+  // Handle different yearly returns formats
+  const years = data.years || [];
+  let strategy = data.strategy || data.strategy_yearly_compounded || data.strategy_compounded_pct || [];
+  let price = data.price || data.asset_yearly || data.price_compounded_pct || [];
+
+  return {
+    status: "ok",
+    data: {
+      years: Array.isArray(years) ? years : [],
+      strategy: Array.isArray(strategy) ? strategy : [],
+      price: Array.isArray(price) ? price : []
+    }
+  };
+} catch (err) {
+  console.error("❌ Yearly returns normalization failed:", err);
+  return { status: "error", error: err instanceof Error ? err.message : String(err) };
+}
+}
+
+interface MetricCardProps {
+  title: string;
+  value: string | number;
+}
+
+
+function MetricCard({ title, value }: MetricCardProps) {
+  return (
+    <div className="bg-card/50 border border-border/40 rounded-lg p-2 flex flex-col items-center justify-center text-center h-14">
+      <div className="text-lg font-bold text-foreground">{value}</div>
+      <div className="text-xs font-medium text-white/90">{title}</div>
+    </div>
+  );
+}
+
+interface ChartFallbackProps {
+  title: string;
+  artifactName?: string;
+  error?: string;
+}
+
+function ChartFallback({ title, artifactName, error }: ChartFallbackProps) {
+  return (
+    <div className="bg-card/50 border border-border/40 rounded-lg p-6 flex items-center justify-center min-h-[320px]">
+      <div className="text-center">
+        <div className="text-white/90 mb-2">📊</div>
+        <h4 className="text-sm font-medium text-foreground mb-2">{title}</h4>
+        <p className="text-xs text-white/90 mb-2">
+          Chart cannot be rendered
+        </p>
+        {artifactName && (
+          <p className="text-xs text-white/90">
+            Tried to load: <code className="bg-secondary px-1 rounded">{artifactName}</code>
+          </p>
+        )}
+        {error && (
+          <p className="text-xs text-red-400 mt-2">
+            Error: {error}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function LabelingOptimizerResults() {
+  const { runId } = useParams<{ runId: string }>();
+  const [artifacts, setArtifacts] = useState<string[]>([]);
+  const [resolvedArtifacts, setResolvedArtifacts] = useState<Record<string, string>>({});
+
+  const [metrics, setMetrics] = useState<Section<any>>({ status: "missing" });
+  const [heatmapsCagr, setHeatmapsCagr] = useState<Section<any>>({ status: "missing" });
+  const [heatmapsLinear, setHeatmapsLinear] = useState<Section<any>>({ status: "missing" });
+  const [voxelCube, setVoxelCube] = useState<Section<any>>({ status: "missing" });
+  const [timeseries, setTimeseries] = useState<Section<any>>({ status: "missing" });
+  const [yearlyReturns, setYearlyReturns] = useState<Section<any>>({ status: "missing" });
+
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [debugData, setDebugData] = useState<Record<string, any>>({});
+  const [showDebug, setShowDebug] = useState(process.env.NODE_ENV !== "production");
+  const [currentHeatmapIndex, setCurrentHeatmapIndex] = useState(0);
+  const [heatmapHorizons, setHeatmapHorizons] = useState<string[]>([]);
+  const [runtimeError, setRuntimeError] = useState<Error | null>(null);
+
+  type Section<T> = { status: "ok"; data: T } | { status: "missing" } | { status: "error"; error: string };
+
+  // Global error logging
+  useEffect(() => {
+    const handleError = (event: ErrorEvent) => {
+      console.error("🚨 Global error caught:", event.error);
+      setRuntimeError(event.error);
+    };
+
+    const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
+      console.error("🚨 Unhandled promise rejection:", event.reason);
+      setRuntimeError(event.reason instanceof Error ? event.reason : new Error(String(event.reason)));
+    };
+
+    window.addEventListener("error", handleError);
+    window.addEventListener("unhandledrejection", handleUnhandledRejection);
+
+    return () => {
+      window.removeEventListener("error", handleError);
+      window.removeEventListener("unhandledrejection", handleUnhandledRejection);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!runId) return undefined;
+
+    const loadData = async () => {
+      try {
+        console.log('🔍 Loading results for run:', runId);
+
+        // Get list of available artifacts
+        const artifactsResponse = await labelingOptimizerApi.listArtifacts(runId);
+        const availableArtifacts = artifactsResponse.artifacts;
+        console.log('📁 Available artifacts:', availableArtifacts);
+        setArtifacts(availableArtifacts);
+
+        // Get symbol from metrics first (needed for some resolvers)
+        let symbol: string | undefined;
+        const metricsName = resolveMetrics(availableArtifacts);
+        if (metricsName) {
+          try {
+            const metricsData = await labelingOptimizerApi.getArtifact(runId, metricsName);
+            console.log('📊 Metrics loaded:', Object.keys(metricsData));
+            setMetrics(metricsData);
+            setDebugData(prev => ({ ...prev, metrics: metricsData }));
+            symbol = metricsData.symbol;
+          } catch (err) {
+            console.warn('Failed to load metrics:', err);
+          }
+        }
+
+        // Resolve artifact names dynamically
+        const resolved = {
+          metrics: metricsName,
+          heatmapsCagr: resolveHeatmapsCagr(availableArtifacts),
+          heatmapsLinear: resolveHeatmapsLinear(availableArtifacts),
+          voxelCube: resolveVoxelCube(availableArtifacts, symbol),
+          timeseries: resolveTimeseries(availableArtifacts, symbol),
+          yearlyReturns: resolveYearlyReturns(availableArtifacts, symbol),
+        };
+        console.log('🔗 Resolved artifact names:', resolved);
+        setResolvedArtifacts(resolved);
+
+        // Load and normalize each artifact
+        const loadAndNormalizeArtifact = async (
+          resolvedName: string | null,
+          normalizer: (data: any, symbol?: string) => Section<any>,
+          setter: (data: Section<any>) => void,
+          debugKey: string
+        ) => {
+          if (!resolvedName) {
+            console.warn(`❌ No resolved name for ${debugKey}`);
+            return;
+          }
+
+          try {
+            console.log(`📥 Loading ${debugKey} from ${resolvedName}`);
+            const data = await labelingOptimizerApi.getArtifact(runId, resolvedName);
+            console.log(`✅ ${debugKey} loaded, keys:`, Object.keys(data));
+
+            const normalized = normalizer(data, symbol);
+            console.log(`🔄 ${debugKey} normalized, shape:`, {
+              type: Array.isArray(normalized) ? 'array' : typeof normalized,
+              length: Array.isArray(normalized) ? normalized.length : 'N/A',
+              keys: normalized && typeof normalized === 'object' ? Object.keys(normalized) : 'N/A'
+            });
+
+            setter(normalized);
+            setDebugData(prev => ({ ...prev, [debugKey]: normalized }));
+          } catch (err) {
+            console.error(`❌ Failed to load ${debugKey}:`, err);
+            setDebugData(prev => ({ ...prev, [`${debugKey}_error`]: err }));
+          }
+        };
+
+        const results = await Promise.allSettled([
+          loadAndNormalizeArtifact(resolved.heatmapsCagr, normalizeHeatmaps, setHeatmapsCagr, 'heatmapsCagr'),
+          loadAndNormalizeArtifact(resolved.heatmapsLinear, normalizeHeatmaps, setHeatmapsLinear, 'heatmapsLinear'),
+          loadAndNormalizeArtifact(resolved.voxelCube, normalizeVoxelCube, setVoxelCube, 'voxelCube'),
+          loadAndNormalizeArtifact(resolved.timeseries, normalizeTimeseries, setTimeseries, 'timeseries'),
+          loadAndNormalizeArtifact(resolved.yearlyReturns, normalizeYearlyReturns, setYearlyReturns, 'yearlyReturns'),
+        ]);
+
+        console.log('📊 All artifacts loaded:', results.map((r, i) => ({
+          index: i,
+          status: r.status,
+          ...(r.status === 'rejected' ? { reason: r.reason } : {})
+        })));
+
+        // Set heatmap horizons for carousel (only if heatmapsCagr loaded successfully)
+        // We need to check the current state after loading
+        setTimeout(() => {
+          // Use a timeout to ensure state has been updated
+          setHeatmapsCagr(current => {
+            if (current.status === 'ok' && current.data?.horizons) {
+              const horizons = Object.keys(current.data.horizons).sort((a, b) => parseInt(a) - parseInt(b));
+              setHeatmapHorizons(horizons);
+            }
+            return current;
+          });
+        }, 0);
+
+      } catch (err) {
+        console.error('❌ Failed to load results:', err);
+        setError(err instanceof Error ? err.message : "Failed to load results");
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    loadData();
+  }, [runId]);
+
+  if (!runId) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-center">
+          <h1 className="text-2xl font-bold text-foreground mb-4">Invalid Run ID</h1>
+          <Link to="/products/labeling-optimizer/technical" className="btn-primary">
+            Start New Run
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-center">
+          <div className="w-8 h-8 border-4 border-primary/30 border-t-primary rounded-full animate-spin mx-auto mb-4" />
+          <p className="text-white/90">Loading optimization results...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-center">
+          <h1 className="text-2xl font-bold text-foreground mb-4">Error Loading Results</h1>
+          <p className="text-white/90 mb-6">{error}</p>
+          <Link to="/products/labeling-optimizer/technical" className="btn-primary">
+            Start New Run
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  // Show runtime error banner if caught
+  const runtimeErrorBanner = runtimeError ? (
+    <div className="fixed top-4 left-4 right-4 z-50 bg-red-900/90 border border-red-500/50 rounded-lg p-4 shadow-lg">
+      <div className="flex items-start gap-3">
+        <div className="text-red-400 text-xl">🚨</div>
+        <div className="flex-1">
+          <h3 className="font-semibold text-red-300 mb-2">Runtime Error Caught</h3>
+          <div className="text-sm text-red-200 mb-2">
+            <strong>{runtimeError.name}:</strong> {runtimeError.message}
+          </div>
+          <details className="text-xs">
+            <summary className="cursor-pointer text-red-300 hover:text-red-200">Show Stack Trace</summary>
+            <pre className="mt-2 p-2 bg-black/50 rounded text-red-100 whitespace-pre-wrap overflow-x-auto max-h-32">
+              {runtimeError.stack}
+            </pre>
+          </details>
+        </div>
+        <button
+          onClick={() => setRuntimeError(null)}
+          className="text-red-400 hover:text-red-300 text-xl"
+        >
+          ×
+        </button>
+      </div>
+    </div>
+  ) : null;
+
+  // Debug UI (development only)
+  const DebugPanel = () => {
+    if (!showDebug) return null;
+
+    return (
+      <div className="bg-yellow-900/20 border border-yellow-500/30 rounded-lg p-4 mb-8">
+        <h3 className="text-lg font-semibold text-yellow-400 mb-4">🔧 Debug Panel</h3>
+        <div className="space-y-4">
+          <div>
+            <strong>Backend URL:</strong> {import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8001'}
+          </div>
+          <div>
+            <strong>Available Artifacts:</strong>
+            <div className="mt-2 space-y-1">
+              {artifacts.map(name => (
+                <div key={name} className="text-sm font-mono bg-black/20 px-2 py-1 rounded">
+                  {name}
+                </div>
+              ))}
+            </div>
+          </div>
+          <div>
+            <strong>Resolved Names:</strong>
+            <pre className="text-xs bg-black/20 p-2 rounded mt-2 overflow-x-auto">
+              {JSON.stringify(resolvedArtifacts, null, 2)}
+            </pre>
+          </div>
+          <div>
+            <strong>Raw JSON Previews:</strong>
+            {Object.entries(debugData).map(([key, data]) => (
+              <div key={key} className="mt-4">
+                <div className="font-semibold text-sm">{key}:</div>
+                <pre className="text-xs bg-black/20 p-2 rounded mt-1 overflow-x-auto max-h-32">
+                  {JSON.stringify(data, null, 2).substring(0, 500)}...
+                </pre>
+              </div>
+            ))}
+          </div>
+          <button
+            onClick={() => setShowDebug(false)}
+            className="px-3 py-1 bg-yellow-600 text-black rounded text-sm"
+          >
+            Hide Debug
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="min-h-screen relative overflow-hidden bg-background">
+      {/* Clean gradient background */}
+      <div className="absolute inset-0 pointer-events-none">
+        <div className="absolute inset-0 bg-gradient-to-br from-background via-background to-card" />
+        <div className="absolute bottom-0 left-0 right-0 h-32 bg-gradient-to-t from-background to-transparent" />
+      </div>
+
+      {/* Runtime error banner */}
+      {/* {runtimeErrorBanner} */}
+
+      <div className="relative pt-32 pb-24">
+        <div className="container-aligned">
+          {/* Header */}
+          <div className="mb-8">
+            <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-6">
+              <div className="flex-1">
+                <h1 className="text-3xl md:text-4xl font-bold text-foreground mb-2">
+                  Advanced Analytics Dashboard
+                </h1>
+                {metrics.status === 'ok' && metrics.data.symbol && (
+                  <p className="text-white/90 text-lg">
+                    {metrics.data.symbol}: {metrics.data.start_date || '2020-01-01'} → {metrics.data.end_date || '2025-01-01'}
+                  </p>
+                )}
+              </div>
+
+              <div className="flex items-center justify-between lg:justify-end gap-4">
+                <div className="flex items-center gap-2 text-sm text-white/90">
+                  <div className="w-2 h-2 bg-green-500 rounded-full"></div>
+                  <span>Backend: Local FastAPI</span>
+                </div>
+
+                <Link
+                  to={`/products/labeling-optimizer/run/${runId}`}
+                  className="btn-secondary"
+                >
+                  Back to Run
+                </Link>
+              </div>
+            </div>
+          </div>
+
+          {/* Debug Panel */}
+          <DebugPanel />
+
+          {/* KPI Cards */}
+          {metrics.status === 'ok' && (
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 mb-8">
+              <MetricCard
+                title="Best TP"
+                value={metrics.data.best_tp ? `${(metrics.data.best_tp * 100).toFixed(1)}%` : "—"}
+              />
+              <MetricCard
+                title="Best SL"
+                value={metrics.data.best_sl ? `${(metrics.data.best_sl * 100).toFixed(1)}%` : "—"}
+              />
+              <MetricCard
+                title="Best Horizon"
+                value={metrics.data.best_h || metrics.data.best_horizon ? `${metrics.data.best_h || metrics.data.best_horizon}d` : "—"}
+              />
+              <MetricCard
+                title="Best CAGR"
+                value={metrics.data.best_cagr ? `${metrics.data.best_cagr.toFixed(2)}%` : "—"}
+              />
+              <MetricCard
+                title="Best Linear P/L"
+                value={metrics.data.best_linear_annual_pl || metrics.data.best_linear_per_year_pct ? `${(metrics.data.best_linear_annual_pl || metrics.data.best_linear_per_year_pct).toFixed(2)}%` : "—"}
+              />
+            </div>
+          )}
+
+          {/* Main Charts Grid */}
+          <div className="space-y-8">
+            {/* First Row: Voxel + Right Charts */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            {/* 3D Voxel Cube - Left Column */}
+            <div className="bg-card/50 border border-border/40 rounded-lg p-6">
+              <h3 className="text-base font-medium text-foreground mb-1">
+                TP–SL–H 3D Search Space — Metric: CAGR (%)
+              </h3>
+              <p className="text-xs text-white/90 mb-3">
+                Each point represents one TP/SL/H combination, colored by compounded CAGR
+              </p>
+              {voxelCube.status === 'ok' ? (
+                <div className="h-96 min-h-[400px]">
+                  <Plot
+                    data={[{
+                      type: 'scatter3d',
+                      mode: 'markers',
+                      x: voxelCube.data.tp,
+                      y: voxelCube.data.sl,
+                      z: voxelCube.data.h,
+                      marker: {
+                        size: 3,
+                        color: voxelCube.data.metric,
+                        colorscale: voxelCube.data.colorscale || 'Viridis',
+                        showscale: true,
+                        colorbar: {
+                          title: 'CAGR (%)',
+                          thickness: 20,
+                          len: 0.7,
+                        },
+                      },
+                    }]}
+                    layout={{
+                      margin: { l: 0, r: 0, t: 0, b: 0 },
+                      scene: {
+                        xaxis: { title: 'Take Profit (%)' },
+                        yaxis: { title: 'Stop Loss (%)' },
+                        zaxis: { title: 'Horizon' },
+                        camera: {
+                          eye: { x: 1.5, y: 1.5, z: 1.5 }
+                        }
+                      },
+                      paper_bgcolor: 'transparent',
+                      plot_bgcolor: 'transparent',
+                    }}
+                    config={{
+                      displayModeBar: false,
+                      responsive: true,
+                    }}
+                    style={{ width: '100%', height: '100%' }}
+                  />
+                  <p className="text-xs text-white/90 mt-2">
+                    3D export uses raster snapshot; 2D charts export as SVG
+                  </p>
+                </div>
+              ) : (
+                <ChartFallback
+                  title="3D Search Space"
+                  artifactName={resolvedArtifacts.voxelCube}
+                  error={voxelCube.status === 'error' ? `Error: ${voxelCube.error}` : "No voxel data available"}
+                />
+              )}
+            </div>
+
+            {/* Right Column - Stacked Charts */}
+            <div className="space-y-8">
+              {/* Best System Equity Curve */}
+              <div className="bg-card/50 border border-border/40 rounded-lg p-4">
+                <h3 className="text-base font-medium text-foreground mb-2">
+                  Best System — Compounded Equity Curve vs Price
+                </h3>
+                {timeseries.status === 'ok' ? (
+                  <div className="h-80 min-h-[320px]">
+                    <Plot
+                      data={[
+                        {
+                          type: 'scatter',
+                          mode: 'lines',
+                          name: 'Strategy Equity',
+                          x: timeseries.data.dates,
+                          y: timeseries.data.strategy,
+                          line: { color: '#10b981', width: 2 },
+                        },
+                        {
+                          type: 'scatter',
+                          mode: 'lines',
+                          name: 'Price',
+                          x: timeseries.data.price_dates,
+                          y: timeseries.data.price,
+                          line: { color: '#8b5cf6', width: 1, dash: 'dot' },
+                          yaxis: 'y2',
+                        },
+                      ]}
+                      layout={{
+                        margin: { l: 40, r: 40, t: 10, b: 80 },
+                        xaxis: {
+                          title: { text: 'Date', font: { size: 10 } },
+                          tickfont: { size: 9 }
+                        },
+                        yaxis: {
+                          title: { text: 'Strategy Equity ($)', font: { size: 10 } },
+                          side: 'left',
+                          tickfont: { size: 9 }
+                        },
+                        yaxis2: {
+                          title: { text: 'Price ($)', font: { size: 10 } },
+                          side: 'right',
+                          overlaying: 'y',
+                          showgrid: false,
+                          tickfont: { size: 9 }
+                        },
+                        showlegend: true,
+                        legend: {
+                          orientation: 'h',
+                          x: 0.5,
+                          xanchor: 'center',
+                          y: -0.1,
+                          yanchor: 'top',
+                          font: { size: 10 }
+                        },
+                        paper_bgcolor: 'transparent',
+                        plot_bgcolor: 'transparent',
+                      }}
+                      config={{
+                        displayModeBar: false,
+                        responsive: true,
+                        toImageButtonOptions: { format: 'svg' },
+                      }}
+                      style={{ width: '100%', height: '100%' }}
+                    />
+                  </div>
+                ) : (
+                  <ChartFallback
+                    title="Equity Curve"
+                    artifactName={resolvedArtifacts.timeseries}
+                    error={timeseries.status === 'error' ? `Error: ${timeseries.error}` : "No timeseries data available"}
+                  />
+                )}
+              </div>
+
+              {/* Yearly Returns */}
+              <div className="bg-card/50 border border-border/40 rounded-lg p-4">
+                <h3 className="text-base font-medium text-foreground mb-2">
+                  Yearly Compounded Returns — Strategy vs Price
+                </h3>
+                {yearlyReturns.status === 'ok' ? (
+                  <div className="h-80 min-h-[320px]">
+                    <Plot
+                      data={[
+                      {
+                        type: 'bar',
+                        name: 'Strategy',
+                        x: yearlyReturns.data.years,
+                        y: yearlyReturns.data.strategy,
+                        marker: { color: '#10b981' },
+                      },
+                      {
+                        type: 'bar',
+                        name: 'Price',
+                        x: yearlyReturns.data.years,
+                        y: yearlyReturns.data.price,
+                        marker: { color: '#8b5cf6' },
+                      },
+                      ]}
+                    layout={{
+                      margin: { l: 40, r: 40, t: 10, b: 80 },
+                      xaxis: {
+                        title: { text: 'Year', font: { size: 10 } },
+                        tickfont: { size: 9 }
+                      },
+                      yaxis: {
+                        title: { text: 'Compounded Return (%)', font: { size: 10 } },
+                        tickfont: { size: 9 }
+                      },
+                      barmode: 'group',
+                      showlegend: true,
+                      legend: {
+                        orientation: 'h',
+                        x: 0.5,
+                        xanchor: 'center',
+                        y: -0.15,
+                        yanchor: 'top'
+                      },
+                      paper_bgcolor: 'transparent',
+                      plot_bgcolor: 'transparent',
+                    }}
+                    config={{
+                      displayModeBar: false,
+                      responsive: true,
+                      toImageButtonOptions: { format: 'svg' },
+                    }}
+                      style={{ width: '100%', height: '100%' }}
+                    />
+                  </div>
+                ) : (
+                  <ChartFallback
+                    title="Yearly Returns"
+                    artifactName={resolvedArtifacts.yearlyReturns}
+                    error={yearlyReturns.status === 'error' ? `Error: ${yearlyReturns.error}` : "No yearly returns data available"}
+                  />
+                )}
+              </div>
+            </div>
+
+            {/* Second Row: Heatmap + Coming Soon */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+              {/* Heatmap Card */}
+              <div className="bg-card/50 border border-border/40 rounded-lg p-6 min-h-[400px]">
+                <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4 mb-4">
+                  <div className="flex-1">
+                    <h3 className="text-lg font-medium text-foreground">
+                      TP–SL Heatmaps (CAGR %) for key horizons
+                    </h3>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setCurrentHeatmapIndex((prev) => (prev - 1 + heatmapHorizons.length) % heatmapHorizons.length)}
+                      className="p-2 hover:bg-secondary rounded-md transition-colors"
+                      disabled={heatmapHorizons.length <= 1}
+                    >
+                      <ChevronLeft className="w-4 h-4" />
+                    </button>
+                    <span className="text-sm text-white/90 min-w-[60px] text-center">
+                      {(currentHeatmapIndex || 0) + 1} / {heatmapHorizons.length}
+                    </span>
+                    <button
+                      onClick={() => setCurrentHeatmapIndex((prev) => (prev + 1) % heatmapHorizons.length)}
+                      className="p-2 hover:bg-secondary rounded-md transition-colors"
+                      disabled={heatmapHorizons.length <= 1}
+                    >
+                      <ChevronRight className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mb-3">
+                  <h4 className="text-base font-medium text-foreground">
+                    Horizon: {(heatmapHorizons[currentHeatmapIndex || 0])} candle{parseInt(heatmapHorizons[currentHeatmapIndex || 0]) > 1 ? 's' : ''}
+                  </h4>
+                </div>
+
+                {heatmapsCagr.status === 'ok' ? (
+                  (() => {
+                    const horizonKey = heatmapHorizons[currentHeatmapIndex || 0].toString();
+                    const matrix = heatmapsCagr.data.horizons[horizonKey];
+                    const allValues = Object.values(heatmapsCagr.data.horizons).flat().filter((x: any) => !isNaN(x) && typeof x === 'number') as number[];
+                    const globalMin = Math.min(...allValues);
+                    const globalMax = Math.max(...allValues);
+                    const vmin = heatmapsCagr.data.vmin ?? globalMin;
+                    const vmax = heatmapsCagr.data.vmax ?? globalMax;
+
+                    return matrix ? (
+                      <div className="aspect-square w-full max-w-sm mx-auto">
+                        <Plot
+                          data={[{
+                            type: 'heatmap',
+                            z: matrix,
+                            x: heatmapsCagr.data.tp_values,
+                            y: heatmapsCagr.data.sl_values,
+                            colorscale: 'Viridis',
+                            zmin: vmin,
+                            zmax: vmax,
+                            showscale: true,
+                            colorbar: {
+                              title: { text: 'CAGR %', font: { size: 10 } },
+                              thickness: 15,
+                              len: 0.7,
+                            },
+                          }]}
+                          layout={{
+                            margin: { l: 60, r: 80, t: 10, b: 40 },
+                            xaxis: {
+                              title: { text: 'Take Profit (%)', font: { size: 9 } },
+                              tickfont: { size: 8 }
+                            },
+                            yaxis: {
+                              title: { text: 'Stop Loss (%)', font: { size: 9 } },
+                              tickfont: { size: 8 }
+                            },
+                            paper_bgcolor: 'transparent',
+                            plot_bgcolor: 'transparent',
+                          }}
+                          config={{
+                            displayModeBar: false,
+                            responsive: true,
+                            toImageButtonOptions: { format: 'svg' },
+                          }}
+                          style={{ width: '100%', height: '100%' }}
+                          useResizeHandler={true}
+                        />
+                      </div>
+                    ) : (
+                      <ChartFallback
+                        title={`Horizon ${heatmapHorizons[currentHeatmapIndex || 0]}`}
+                        artifactName={resolvedArtifacts.heatmapsCagr}
+                        error={heatmapsCagr.status === 'error' ? `Error: ${heatmapsCagr.error}` : `Missing heatmap data for horizon ${heatmapHorizons[currentHeatmapIndex || 0]}`}
+                      />
+                    );
+                  })()
+                ) : (
+                  <ChartFallback
+                    title="Heatmaps"
+                    artifactName={resolvedArtifacts.heatmapsCagr}
+                    error="No heatmap data available"
+                  />
+                )}
+              </div>
+
+              {/* Coming Soon Card */}
+              <div className="bg-card/50 border border-border/40 rounded-lg p-6 flex items-center justify-center min-h-[420px]">
+                <div className="text-center">
+                  <div className="text-2xl mb-2">🚀</div>
+                  <h4 className="text-lg font-medium text-foreground mb-2">
+                    Additional Output
+                  </h4>
+                  <p className="text-sm text-white/90 mb-1">Coming soon</p>
+                  <p className="text-xs text-white/90">Trade-by-trade analysis</p>
+                  <p className="text-xs text-white/90">Performance metrics</p>
+                  <p className="text-xs text-white/90">Risk analysis</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    </div>
+  );
+}
