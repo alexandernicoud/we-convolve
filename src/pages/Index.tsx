@@ -35,7 +35,7 @@ function ScrollFade({
   );
 }
 import MetricsCards from "@/components/MetricsCards";
-import { Button } from "@/components/ui/button";
+import Button from "@/components/ui/button";
 
 const products: PinnedProduct[] = [
   {
